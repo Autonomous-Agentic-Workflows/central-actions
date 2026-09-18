@@ -89,3 +89,15 @@ permissions:
 ```
 
 `GITHUB_TOKEN` is used only for the Pages fallback commit; Cloud Run uses the short-lived OIDC token.
+
+## 6. Known org-level blocker (2026-09-18)
+
+Every Actions run in the `Autonomous-Agentic-Workflows` org (this repo, `MasterRecoveryAgents`,
+and the Copilot reviewer) currently ends in `startup_failure` with the annotation:
+
+> The job was not started because recent account payments have failed or your spending limit needs to be increased.
+
+This is a billing setting, not a workflow error: the identical files run green in the
+`conor-ops/central-actions` staging copy. Fix it as an org owner at
+`Settings > Billing and licensing > Spending limits` (Actions) or by updating the payment method.
+Until then no reusable workflow from this repo can execute for private org repositories.
