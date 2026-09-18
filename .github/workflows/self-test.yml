@@ -1,0 +1,58 @@
+name: Self-test
+
+# Validates this repository on every change: workflow lint, script lint,
+# and a dry run of the irue-scan composite action against this repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) >/dev/null
+          ./actionlint -no-color -oneline .github/workflows/*.yml templates/consumer-deploy.yml
+      - name: ruff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q ruff
+          ruff check --isolated --line-length 160 actions/irue-scan/scripts
+
+  irue-dry-run:
+    name: IRUE scan dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run composite action against this repo
+        id: scan
+        uses: ./actions/irue-scan
+        with:
+          output-dir: public
+          upload-profile: 'false'
+      - name: Assert outputs
+        shell: bash
+        env:
+          TOOLS: ${{ steps.scan.outputs.tool-count }}
+          LANGS: ${{ steps.scan.outputs.languages }}
+        run: |
+          set -euo pipefail
+          test -s public/index.html
+          test -s public/.well-known/webmcp.json
+          test -f public/.nojekyll
+          python3 -c 'import json; json.load(open("public/.well-known/webmcp.json"))'
+          echo "languages=${LANGS} tools=${TOOLS}"

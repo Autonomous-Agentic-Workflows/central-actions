@@ -1,31 +1,268 @@
-name: Central DevOps Pipeline
+name: Central CI
+
+# Reusable workflow: universal lint, unit test and CodeQL security scan.
+# Consumers call this with:
+#   uses: Autonomous-Agentic-Workflows/central-actions/.github/workflows/central-ci.yml@v1.0.0
+#
+# Language support is auto-detected from the consumer repository:
+#   - Python  (pyproject.toml / requirements*.txt / setup.py / *.py)  -> ruff + pytest
+#   - Node    (package.json)                                            -> npm ci + lint + test
+#   - Others  (Go, Java, C#, Ruby, Swift, Kotlin, C/C++)                -> CodeQL only
+#
+# CodeQL on PRIVATE repositories requires GitHub Advanced Security (GHAS).
+# Set run-codeql: false for private repos without GHAS to avoid a hard failure.
 
 on:
   workflow_call:
     inputs:
       environment:
-        description: Target environment for the run
+        description: 'Logical environment label used in job summaries (e.g. production, staging)'
         required: false
-        default: development
         type: string
+        default: 'production'
+      python-version:
+        description: 'Python version used for lint and tests'
+        required: false
+        type: string
+        default: '3.11'
+      node-version:
+        description: 'Node.js version used for lint and tests'
+        required: false
+        type: string
+        default: '20'
+      run-codeql:
+        description: 'Run the CodeQL security scan'
+        required: false
+        type: boolean
+        default: true
+      codeql-languages:
+        description: 'Comma-separated CodeQL languages. Leave empty to auto-detect.'
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: 'Sub-directory containing the project (monorepo support)'
+        required: false
+        type: string
+        default: '.'
+      fail-on-lint:
+        description: 'Fail the workflow when lint reports errors'
+        required: false
+        type: boolean
+        default: true
       language:
-        description: CodeQL language to analyze
+        description: 'DEPRECATED (v1.0.0 compatibility). Single CodeQL language; prefer codeql-languages.'
         required: false
-        default: javascript
         type: string
+        default: ''
     secrets:
       DEPLOY_TOKEN:
+        description: 'DEPRECATED (v1.0.0 compatibility). Not used by CI; deployments authenticate via OIDC.'
         required: false
+    outputs:
+      languages:
+        description: 'JSON array of languages detected in the repository'
+        value: ${{ jobs.detect.outputs.languages }}
 
 permissions:
   contents: read
   security-events: write
-  id-token: write
+  actions: read
+
+concurrency:
+  group: central-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-scan:
-    name: Build and scan (${{ inputs.environment }})
+  detect:
+    name: Detect stack
     runs-on: ubuntu-latest
+    outputs:
+      has-python: ${{ steps.detect.outputs.has_python }}
+      has-node: ${{ steps.detect.outputs.has_node }}
+      languages: ${{ steps.detect.outputs.languages }}
+      codeql-matrix: ${{ steps.detect.outputs.codeql_matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect languages and manifests
+        id: detect
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          REQUESTED_LANGS: ${{ inputs.codeql-languages }}
+          LEGACY_LANG: ${{ inputs.language }}
+        run: |
+          set -euo pipefail
+          # v1.0.0 exposed a single `language` input; honour it when the new input is unset.
+          if [ -z "${REQUESTED_LANGS}" ] && [ -n "${LEGACY_LANG}" ]; then
+            case "${LEGACY_LANG}" in
+              javascript|typescript) REQUESTED_LANGS="javascript-typescript" ;;
+              java|kotlin)           REQUESTED_LANGS="java-kotlin" ;;
+              cpp|c)                 REQUESTED_LANGS="c-cpp" ;;
+              *)                     REQUESTED_LANGS="${LEGACY_LANG}" ;;
+            esac
+            echo "::warning::input 'language' is deprecated; use 'codeql-languages' instead."
+          fi
+          has_python=false; has_node=false
+          langs=()
+
+          # --- Python -------------------------------------------------------
+          if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ] || ls requirements*.txt >/dev/null 2>&1 \
+             || [ -n "$(find . -name '*.py' -not -path '*/node_modules/*' -not -path './.git/*' -print -quit)" ]; then
+            has_python=true; langs+=("python")
+          fi
+          # --- Node / JavaScript / TypeScript --------------------------------
+          if [ -f package.json ] \
+             || [ -n "$(find . \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' \) -not -path '*/node_modules/*' -not -path './.git/*' -print -quit)" ]; then
+            [ -f package.json ] && has_node=true
+            langs+=("javascript-typescript")
+          fi
+          # --- Others (CodeQL only) -----------------------------------------
+          [ -f go.mod ] && langs+=("go")
+          { [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; } && langs+=("java-kotlin")
+          [ -n "$(find . -name '*.csproj' -print -quit)" ] && langs+=("csharp")
+          [ -f Gemfile ] && langs+=("ruby")
+          [ -f Package.swift ] && langs+=("swift")
+          [ -n "$(find . \( -name '*.c' -o -name '*.cpp' -o -name '*.cc' \) -not -path './.git/*' -print -quit)" ] && langs+=("c-cpp")
+
+          # Explicit override from the caller wins.
+          if [ -n "${REQUESTED_LANGS}" ]; then
+            IFS=',' read -r -a langs <<< "$(echo "${REQUESTED_LANGS}" | tr -d ' ')"
+          fi
+
+          langs_json=$(printf '%s\n' "${langs[@]:-}" | grep -v '^$' | jq -R . | jq -sc 'unique')
+          {
+            echo "has_python=${has_python}"
+            echo "has_node=${has_node}"
+            echo "languages=${langs_json}"
+            echo "codeql_matrix=${langs_json}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Central CI — stack detection (${{ inputs.environment }})"
+            echo ""
+            echo "| Signal | Value |"
+            echo "|---|---|"
+            echo "| Python project | ${has_python} |"
+            echo "| Node project | ${has_node} |"
+            echo "| CodeQL languages | \`${langs_json}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  python:
+    name: Python lint and test
+    needs: detect
+    if: needs.detect.outputs.has-python == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install ruff pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e . 2>/dev/null || true; fi
+
+      - name: Lint (ruff)
+        shell: bash
+        env:
+          FAIL_ON_LINT: ${{ inputs.fail-on-lint }}
+        run: |
+          set -euo pipefail
+          if [ "${FAIL_ON_LINT}" = "true" ]; then
+            ruff check . --output-format=github
+          else
+            ruff check . --output-format=github || echo "::warning::Lint reported issues (fail-on-lint=false)"
+          fi
+
+      - name: Unit tests (pytest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d tests ] || [ -n "$(find . -name 'test_*.py' -not -path '*/node_modules/*' -not -path './.git/*' -print -quit)" ]; then
+            pytest -q --maxfail=1 --disable-warnings
+          else
+            echo "::notice::No Python tests found — skipping pytest"
+          fi
+
+  node:
+    name: Node lint and test
+    needs: detect
+    if: needs.detect.outputs.has-node == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Lint
+        shell: bash
+        env:
+          FAIL_ON_LINT: ${{ inputs.fail-on-lint }}
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
+            if [ "${FAIL_ON_LINT}" = "true" ]; then npm run lint; else npm run lint || echo "::warning::Lint reported issues"; fi
+          else
+            echo "::notice::No lint script in package.json — skipping"
+          fi
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+            npm test --if-present
+          else
+            echo "::notice::No test script in package.json — skipping"
+          fi
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: detect
+    if: inputs.run-codeql && needs.detect.outputs.codeql-matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.detect.outputs.codeql-matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,12 +270,33 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: ${{ inputs.language }}
-        continue-on-error: true
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
 
-      - name: Perform CodeQL analysis
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
         uses: github/codeql-action/analyze@v3
-        continue-on-error: true
+        with:
+          category: '/language:${{ matrix.language }}'
 
-      - name: Build
-        run: echo "Building for ${{ inputs.environment }}"
+  # Single required status check for branch rulesets: require "Central CI / gate".
+  gate:
+    name: gate
+    needs: [detect, python, node, codeql]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        shell: bash
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq .
+          if echo "$RESULTS" | jq -e '[.[] | .result] | any(. == "failure" or . == "cancelled")' >/dev/null; then
+            echo "::error::One or more Central CI jobs failed"
+            exit 1
+          fi
+          echo "All Central CI jobs passed or were skipped for ${{ inputs.environment }}."

@@ -1,0 +1,247 @@
+name: Deploy Landing Page & WebMCP
+
+# Reusable workflow: IRUE scan -> static landing page + WebMCP manifest ->
+# dual-mode deployment.
+#
+#   Tier B (primary)  : Google Cloud Run via keyless OIDC (Workload Identity Federation)
+#   Tier Z (fallback) : GitHub Pages on the gh-pages branch (zero billing)
+#
+# Consumers call this with:
+#   uses: Autonomous-Agentic-Workflows/central-actions/.github/workflows/deploy-landing-page.yml@v1.1.0
+#
+# GCP secrets are OPTIONAL. If they are absent or OIDC auth fails, and
+# enable-fallback is true, the bundle is published to GitHub Pages instead.
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'Cloud Run service name'
+        required: true
+        type: string
+      gcp-region:
+        description: 'Cloud Run region'
+        required: false
+        type: string
+        default: 'us-central1'
+      enable-fallback:
+        description: 'Publish to GitHub Pages when Cloud Run is unavailable'
+        required: false
+        type: boolean
+        default: true
+      force-fallback:
+        description: 'Skip Cloud Run entirely and publish only to GitHub Pages'
+        required: false
+        type: boolean
+        default: false
+      output-dir:
+        description: 'Directory for the compiled bundle'
+        required: false
+        type: string
+        default: 'public'
+      central-actions-ref:
+        description: 'Ref of Autonomous-Agentic-Workflows/central-actions used for composite actions (keep in sync with the workflow tag)'
+        required: false
+        type: string
+        default: 'v1.1.0'
+      max-instances:
+        description: 'Cloud Run max instances'
+        required: false
+        type: string
+        default: '10'
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: 'projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER'
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        description: 'deployer@PROJECT.iam.gserviceaccount.com'
+        required: false
+      GCP_PROJECT_ID:
+        description: 'GCP project id (optional; derived from the service account when omitted)'
+        required: false
+    outputs:
+      deployment-tier:
+        description: 'cloud-run | github-pages | none'
+        value: ${{ jobs.deploy.outputs.tier }}
+      deployment-url:
+        description: 'Public URL of the deployed landing page'
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: write
+  id-token: write
+  pages: write
+
+concurrency:
+  group: deploy-landing-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan-and-build:
+    name: IRUE scan and build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout central actions
+        uses: actions/checkout@v4
+        with:
+          repository: Autonomous-Agentic-Workflows/central-actions
+          ref: ${{ inputs.central-actions-ref }}
+          path: .central-actions
+
+      - name: Run IRUE scanner and WebMCP compiler
+        id: irue
+        uses: ./.central-actions/actions/irue-scan
+        with:
+          output-dir: ${{ inputs.output-dir }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: landing-page-bundle
+          path: ${{ inputs.output-dir }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy (Cloud Run with Pages fallback)
+    needs: scan-and-build
+    runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.result.outputs.tier }}
+      url: ${{ steps.result.outputs.url }}
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+
+      - name: Checkout central actions
+        uses: actions/checkout@v4
+        with:
+          repository: Autonomous-Agentic-Workflows/central-actions
+          ref: ${{ inputs.central-actions-ref }}
+          path: .central-actions
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: landing-page-bundle
+          path: ${{ inputs.output-dir }}/
+
+      - name: Check whether GCP secrets are configured
+        id: gcp-secrets
+        shell: bash
+        env:
+          WIP: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          FORCE_FALLBACK: ${{ inputs.force-fallback }}
+        run: |
+          if [ "${FORCE_FALLBACK}" = "true" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::force-fallback=true — skipping Cloud Run"
+          elif [ -n "${WIP}" ] && [ -n "${SA}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP OIDC secrets not configured — Cloud Run tier unavailable"
+          fi
+
+      # ---------------------------------------------------------------- Tier B
+      - name: Authenticate to GCP via OIDC
+        id: gcp-auth
+        if: steps.gcp-secrets.outputs.configured == 'true'
+        continue-on-error: true
+        uses: ./.central-actions/actions/setup-gcp-oidc
+        with:
+          workload-identity-provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project-id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Stage static-server Dockerfile into bundle
+        if: steps.gcp-auth.outcome == 'success'
+        shell: bash
+        env:
+          OUT: ${{ inputs.output-dir }}
+        run: |
+          set -euo pipefail
+          cp .central-actions/actions/irue-scan/serve/Dockerfile "${OUT}/Dockerfile"
+          cp .central-actions/actions/irue-scan/serve/nginx.conf "${OUT}/nginx.conf"
+          ls -la "${OUT}"
+
+      - name: Deploy to Cloud Run (primary tier)
+        id: run-deploy
+        if: steps.gcp-auth.outcome == 'success'
+        continue-on-error: true
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ inputs.service-name }}
+          region: ${{ inputs.gcp-region }}
+          project_id: ${{ steps.gcp-auth.outputs.project-id }}
+          source: ${{ inputs.output-dir }}
+          flags: '--allow-unauthenticated --port=8080 --min-instances=0 --max-instances=${{ inputs.max-instances }}'
+          labels: |
+            managed-by=central-actions
+            source-repo=${{ github.event.repository.name }}
+
+      # ---------------------------------------------------------------- Tier Z
+      - name: Fallback to GitHub Pages (zero billing)
+        id: pages-deploy
+        if: >-
+          inputs.enable-fallback &&
+          (steps.gcp-secrets.outputs.configured != 'true' ||
+           steps.gcp-auth.outcome != 'success' ||
+           steps.run-deploy.outcome != 'success')
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./${{ inputs.output-dir }}
+          publish_branch: gh-pages
+          force_orphan: true
+          exclude_assets: 'Dockerfile,nginx.conf'
+          commit_message: 'deploy(landing): ${{ github.sha }} via central-actions fallback tier'
+
+      # ---------------------------------------------------------------- Result
+      - name: Resolve deployment result
+        id: result
+        if: always()
+        shell: bash
+        env:
+          RUN_OUTCOME: ${{ steps.run-deploy.outcome }}
+          RUN_URL: ${{ steps.run-deploy.outputs.url }}
+          PAGES_OUTCOME: ${{ steps.pages-deploy.outcome }}
+          AUTH_OUTCOME: ${{ steps.gcp-auth.outcome }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          tier=none; url=""
+          if [ "${RUN_OUTCOME}" = "success" ]; then
+            tier=cloud-run; url="${RUN_URL}"
+          elif [ "${PAGES_OUTCOME}" = "success" ]; then
+            tier=github-pages; url="https://${OWNER,,}.github.io/${REPO}/"
+          fi
+          echo "tier=${tier}" >> "$GITHUB_OUTPUT"
+          echo "url=${url}"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### Landing page deployment"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| GCP OIDC auth | ${AUTH_OUTCOME:-skipped} |"
+            echo "| Cloud Run deploy | ${RUN_OUTCOME:-skipped} |"
+            echo "| GitHub Pages fallback | ${PAGES_OUTCOME:-skipped} |"
+            echo ""
+            echo "**Tier:** \`${tier}\`"
+            [ -n "${url}" ] && echo "**URL:** ${url}"
+            echo ""
+            echo "WebMCP manifest: \`${url%/}/.well-known/webmcp.json\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${tier}" = "none" ]; then
+            echo "::error::Neither Cloud Run nor GitHub Pages deployment succeeded"
+            exit 1
+          fi
