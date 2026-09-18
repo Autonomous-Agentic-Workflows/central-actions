@@ -133,10 +133,12 @@ jobs:
           fi
 
           langs_json=$(printf '%s\n' "${langs[@]:-}" | grep -v '^$' | jq -R . | jq -sc 'unique')
-          echo "has_python=${has_python}"     >> "$GITHUB_OUTPUT"
-          echo "has_node=${has_node}"         >> "$GITHUB_OUTPUT"
-          echo "languages=${langs_json}"      >> "$GITHUB_OUTPUT"
-          echo "codeql_matrix=${langs_json}"  >> "$GITHUB_OUTPUT"
+          {
+            echo "has_python=${has_python}"
+            echo "has_node=${has_node}"
+            echo "languages=${langs_json}"
+            echo "codeql_matrix=${langs_json}"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "### Central CI — stack detection (${{ inputs.environment }})"
@@ -195,7 +197,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d tests ] || ls test_*.py >/dev/null 2>&1 || ls **/test_*.py >/dev/null 2>&1; then
+          if [ -d tests ] || [ -n "$(find . -name 'test_*.py' -not -path '*/node_modules/*' -not -path './.git/*' -print -quit)" ]; then
             pytest -q --maxfail=1 --disable-warnings
           else
             echo "::notice::No Python tests found — skipping pytest"
