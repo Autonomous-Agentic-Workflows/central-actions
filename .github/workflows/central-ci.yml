@@ -1,0 +1,44 @@
+name: Central DevOps Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment for the run
+        required: false
+        default: development
+        type: string
+      language:
+        description: CodeQL language to analyze
+        required: false
+        default: javascript
+        type: string
+    secrets:
+      DEPLOY_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+  build-and-scan:
+    name: Build and scan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.language }}
+        continue-on-error: true
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+
+      - name: Build
+        run: echo "Building for ${{ inputs.environment }}"
