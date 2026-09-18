@@ -1,0 +1,103 @@
+name: 'Setup GCP OIDC (Workload Identity Federation)'
+description: 'Keyless authentication to Google Cloud via GitHub OIDC. No service-account JSON keys. Installs and configures the gcloud CLI.'
+author: 'Autonomous-Agentic-Workflows (208 Fence and Gate)'
+
+branding:
+  icon: 'key'
+  color: 'blue'
+
+inputs:
+  workload-identity-provider:
+    description: 'Full provider resource name: projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER'
+    required: true
+  service-account:
+    description: 'Service account email to impersonate (e.g. github-deployer@PROJECT.iam.gserviceaccount.com)'
+    required: true
+  project-id:
+    description: 'GCP project id. Derived from the service-account email when omitted.'
+    required: false
+    default: ''
+  install-gcloud:
+    description: 'Install and configure the gcloud CLI'
+    required: false
+    default: 'true'
+  gcloud-components:
+    description: 'Comma-separated extra gcloud components (e.g. beta,gke-gcloud-auth-plugin)'
+    required: false
+    default: ''
+  token-format:
+    description: 'access_token or id_token'
+    required: false
+    default: 'access_token'
+
+outputs:
+  project-id:
+    description: 'Resolved GCP project id'
+    value: ${{ steps.resolve.outputs.project_id }}
+  access-token:
+    description: 'Short-lived OAuth 2.0 access token (masked)'
+    value: ${{ steps.auth.outputs.access_token }}
+  credentials-file:
+    description: 'Path to the generated external-account credentials file'
+    value: ${{ steps.auth.outputs.credentials_file_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        WIP: ${{ inputs.workload-identity-provider }}
+        SA: ${{ inputs.service-account }}
+      run: |
+        set -euo pipefail
+        if [[ ! "${WIP}" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$ ]]; then
+          echo "::error::workload-identity-provider must look like projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER"
+          exit 1
+        fi
+        if [[ ! "${SA}" =~ ^[^@]+@[^@]+\.iam\.gserviceaccount\.com$ ]]; then
+          echo "::error::service-account must be a *.iam.gserviceaccount.com email"
+          exit 1
+        fi
+
+    - name: Resolve project id
+      id: resolve
+      shell: bash
+      env:
+        PROJECT_ID: ${{ inputs.project-id }}
+        SA: ${{ inputs.service-account }}
+      run: |
+        set -euo pipefail
+        pid="${PROJECT_ID}"
+        if [ -z "${pid}" ]; then
+          # github-deployer@my-project.iam.gserviceaccount.com -> my-project
+          pid="${SA#*@}"; pid="${pid%%.iam.gserviceaccount.com}"
+        fi
+        echo "project_id=${pid}" >> "$GITHUB_OUTPUT"
+        echo "Resolved GCP project: ${pid}"
+
+    - name: Authenticate (google-github-actions/auth)
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        project_id: ${{ steps.resolve.outputs.project_id }}
+        token_format: ${{ inputs.token-format }}
+        create_credentials_file: true
+        export_environment_variables: true
+
+    - name: Set up gcloud CLI
+      if: inputs.install-gcloud == 'true'
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ steps.resolve.outputs.project_id }}
+        install_components: ${{ inputs.gcloud-components }}
+
+    - name: Verify identity
+      if: inputs.install-gcloud == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        gcloud config list --format='value(core.project,core.account)' 2>/dev/null || true
+        gcloud auth list --filter=status:ACTIVE --format='value(account)'

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+repo_profile.json
+demo_landing_page.html
+/public/
+/dist/
+/.well-known/
+.central-actions/
+actionlint
+.ruff_cache/

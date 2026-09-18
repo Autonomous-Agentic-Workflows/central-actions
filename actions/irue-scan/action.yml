@@ -1,0 +1,108 @@
+name: 'IRUE Repository Scanner & WebMCP Compiler'
+description: 'Inspects the repository (AST, manifests, workflows, docs) and compiles an interactive landing page plus a WebMCP manifest under .well-known/.'
+author: 'Autonomous-Agentic-Workflows (208 Fence and Gate)'
+
+branding:
+  icon: 'search'
+  color: 'purple'
+
+inputs:
+  output-dir:
+    description: 'Directory that receives the compiled landing page and WebMCP assets'
+    required: false
+    default: 'dist'
+  scan-root:
+    description: 'Directory to scan (relative to the workspace)'
+    required: false
+    default: '.'
+  site-title:
+    description: 'Override the landing page title (defaults to the repository name)'
+    required: false
+    default: ''
+  base-url:
+    description: 'Public base URL used inside the WebMCP manifest (optional; relative URLs are used when empty)'
+    required: false
+    default: ''
+  python-version:
+    description: 'Python version used to run the scanner'
+    required: false
+    default: '3.11'
+  upload-profile:
+    description: 'Also upload repo_profile.json as a workflow artifact'
+    required: false
+    default: 'true'
+
+outputs:
+  profile-path:
+    description: 'Path to the generated repo_profile.json'
+    value: ${{ steps.scan.outputs.profile_path }}
+  bundle-path:
+    description: 'Path to the compiled bundle directory'
+    value: ${{ steps.scan.outputs.bundle_path }}
+  languages:
+    description: 'JSON array of detected languages'
+    value: ${{ steps.scan.outputs.languages }}
+  tool-count:
+    description: 'Number of WebMCP tools exposed in the manifest'
+    value: ${{ steps.scan.outputs.tool_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Execute IRUE scanner and landing page generator
+      id: scan
+      shell: bash
+      env:
+        OUT_DIR: ${{ inputs.output-dir }}
+        SCAN_ROOT: ${{ inputs.scan-root }}
+        SITE_TITLE: ${{ inputs.site-title }}
+        BASE_URL: ${{ inputs.base-url }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT_DIR}/.well-known"
+
+        python3 "${ACTION_PATH}/scripts/irue_scanner.py" "${SCAN_ROOT}" \
+          --exclude "${OUT_DIR}" --exclude .central-actions \
+          > repo_profile.json
+
+        python3 "${ACTION_PATH}/scripts/landing_page_generator.py" repo_profile.json \
+          --output-dir "${OUT_DIR}" \
+          ${SITE_TITLE:+--title "${SITE_TITLE}"} \
+          ${BASE_URL:+--base-url "${BASE_URL}"}
+
+        # Keep the profile next to the bundle for downstream agents.
+        cp repo_profile.json "${OUT_DIR}/repo_profile.json"
+        # Disable Jekyll on GitHub Pages so .well-known/ is served.
+        touch "${OUT_DIR}/.nojekyll"
+
+        langs=$(python3 -c 'import json,sys; print(json.dumps([l["name"] for l in json.load(open("repo_profile.json"))["languages"]]))')
+        tools=$(python3 -c 'import json; print(len(json.load(open("'"${OUT_DIR}"'/.well-known/webmcp.json"))["tools"]))')
+
+        {
+          echo "profile_path=repo_profile.json"
+          echo "bundle_path=${OUT_DIR}"
+          echo "languages=${langs}"
+          echo "tool_count=${tools}"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### IRUE scan"
+          echo ""
+          echo "- Languages: \`${langs}\`"
+          echo "- WebMCP tools exposed: **${tools}**"
+          echo "- Bundle: \`${OUT_DIR}/\` ($(find "${OUT_DIR}" -type f | wc -l) files)"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload repository profile
+      if: inputs.upload-profile == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: irue-repo-profile
+        path: repo_profile.json
+        retention-days: 30

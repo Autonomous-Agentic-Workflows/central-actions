@@ -1,0 +1,39 @@
+# Copy to .github/workflows/deploy.yml in any Autonomous-Agentic-Workflows repository.
+# Replace SERVICE_NAME. Keep the @v1.1.0 pins — never use @main.
+name: Production Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  pages: write
+  security-events: write
+  actions: read
+
+jobs:
+  # Universal lint, unit tests and CodeQL. Required status check: "ci / gate".
+  ci:
+    uses: Autonomous-Agentic-Workflows/central-actions/.github/workflows/central-ci.yml@v1.1.0
+    with:
+      environment: production
+      # run-codeql: false   # uncomment for private repos without GitHub Advanced Security
+
+  # IRUE scan -> landing page + WebMCP manifest -> Cloud Run, falling back to GitHub Pages.
+  deploy-landing:
+    needs: ci
+    if: github.event_name != 'pull_request'
+    uses: Autonomous-Agentic-Workflows/central-actions/.github/workflows/deploy-landing-page.yml@v1.1.0
+    with:
+      service-name: SERVICE_NAME-landing-page
+      gcp-region: us-central1
+      enable-fallback: true
+      central-actions-ref: v1.1.0
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
